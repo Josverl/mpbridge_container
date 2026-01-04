@@ -1,0 +1,10 @@
+name: mpremote-bridge
+
+services:
+  mpremote-bridge:
+    container_name: mpremote-bridge
+    build: .
+    ports:
+      - "2217:2217"
+      - "2218:2218"
+    restart: unless-stopped

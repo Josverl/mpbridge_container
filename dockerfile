@@ -21,6 +21,13 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Install Python using uv
 RUN uv python install ${PYTHON_VERSION}
 
+# Download the bridge script at build time (cached in image)
+ARG BRIDGE_SCRIPT_URL=https://raw.githubusercontent.com/Josverl/micropython/refs/heads/feat/MP_Bridge/tools/mpremote_bridge.py
+RUN curl -LsSf ${BRIDGE_SCRIPT_URL} -o /bridge/mpremote_bridge.py
+
+# Copy readme into the image
+COPY readme.md /bridge/readme.md
+
 # Store Python version as environment variable for runtime
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 ENV MICROPYTHON_PATH=/usr/local/bin/micropython
@@ -28,7 +35,7 @@ ENV MICROPYTHON_PATH=/usr/local/bin/micropython
 EXPOSE 2217
 EXPOSE 2218
 
-# Use a shell entrypoint to allow variable substitution at runtime
-ENTRYPOINT ["/bin/sh", "-c", "uv run --python ${PYTHON_VERSION} --with pyserial https://raw.githubusercontent.com/Josverl/micropython/refs/heads/feat/MP_Bridge/tools/mpremote_bridge.py $@", "--"]
+# Use the locally cached script instead of fetching from URL
+ENTRYPOINT ["/bin/sh", "-c", "uv run --python ${PYTHON_VERSION} --with pyserial /bridge/mpremote_bridge.py $@", "--"]
 CMD ["/usr/local/bin/micropython"]
     

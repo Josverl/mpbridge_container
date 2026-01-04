@@ -4,6 +4,21 @@ A Docker container that runs the MicroPython mpremote bridge, allowing you to co
 
 ## Quick Start
 
+### Using Docker Compose (Recommended)
+
+```bash
+# Build and run (ports configured automatically)
+docker compose up
+
+# Run in background
+docker compose up -d
+
+# Stop
+docker compose down
+```
+
+### Using Docker directly
+
 ```bash
 # Build the image
 docker build -t mpremote-bridge .
@@ -45,6 +60,12 @@ The Dockerfile supports build-time arguments to customize versions:
 |----------|---------|-------------|
 | `MICROPYTHON_VERSION` | `v1.27.0` | MicroPython container version tag |
 | `PYTHON_VERSION` | `3.12` | Python version for running the bridge script |
+| `BRIDGE_SCRIPT_URL` | *(GitHub URL)* | URL to the mpremote_bridge.py script |
+
+> **Note:** The bridge script is downloaded at build time and cached in the image. This means:
+> - Faster container startup (no network fetch)
+> - Works offline after build
+> - Script version is locked at build time
 
 ### Examples
 
@@ -63,6 +84,11 @@ docker build \
   --build-arg MICROPYTHON_VERSION=v1.25.0 \
   --build-arg PYTHON_VERSION=3.11 \
   -t mpremote-bridge:custom .
+
+# Build with a custom bridge script (e.g., from a different branch or fork)
+docker build \
+  --build-arg BRIDGE_SCRIPT_URL=https://raw.githubusercontent.com/user/repo/branch/tools/mpremote_bridge.py \
+  -t mpremote-bridge:custom-script .
 ```
 
 ## Runtime Arguments
