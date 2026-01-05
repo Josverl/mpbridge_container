@@ -1,9 +1,10 @@
-name: mpremote-bridge
+name: mpbridge
 
 services:
-  mpremote-bridge:
-    container_name: mpremote-bridge
+  mpbridge:
+    container_name: mpbridge
     build: .
+    image: josverl/mpbridge:1.27.0
     ports:
       - "2217:2217"
       - "2218:2218"
