@@ -36,6 +36,6 @@ EXPOSE 2217
 EXPOSE 2218
 
 # Use the locally cached script instead of fetching from URL
-ENTRYPOINT ["/bin/sh", "-c", "uv run --python ${PYTHON_VERSION} --with pyserial /bridge/mpremote_bridge.py $@", "--"]
+ENTRYPOINT ["/bin/sh", "-c", "uv run --python ${PYTHON_VERSION} /bridge/mpremote_bridge.py $@", "--"]
 CMD ["/usr/local/bin/micropython"]
     
