@@ -15,6 +15,9 @@ docker compose up -d
 
 # Stop
 docker compose down
+
+# Run in detached mode (background) Optionall mount a local folder with -v
+docker compose run --service-ports -d mpbridge
 ```
 
 ### Using Docker directly
