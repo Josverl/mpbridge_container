@@ -52,6 +52,71 @@ mpremote connect socket://localhost:2218 run my_script.py
 mpremote connect socket://localhost:2218
 ```
 
+## Runtime Arguments
+
+Additional arguments can be passed to the mpremote_bridge.py script:
+
+```bash
+# Run with default arguments
+docker run --rm -p 2217:2217 -p 2218:2218 mpbridge
+
+# Pass custom arguments to the bridge script
+docker run --rm -p 2217:2217 -p 2218:2218 mpbridge /usr/local/bin/micropython --help
+
+# Run in detached mode (background)
+docker run --rm -d -p 2217:2217 -p 2218:2218 --name mpbridge mpbridge
+```
+
+## Mounting Local Folders
+
+To access local files from within the container, use the `-v` flag:
+
+```bash
+# Using docker compose run (detached with ports)
+docker compose run -d -v "/path/to/local/folder:/test_data" --service-ports mpbridge
+
+# Using docker directly
+docker run --rm -d -p 2217:2217 -p 2218:2218 -v "/path/to/local/folder:/test_data" mpbridge
+```
+
+**Flags explained:**
+- `-d` = detached (background)
+- `-v` = mount volume (host_path:container_path)
+- `--service-ports` = expose ports defined in compose file (required for `docker compose run`)
+
+**Example (Windows):**
+```powershell
+docker compose run -d -v "D:/myproject/data:/test_data" --service-ports mpbridge
+```
+
+Files will be available at `/test_data` inside the container.
+
+## Ports
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 2217 | RFC 2217 | Serial port emulation over TCP |
+| 2218 | Raw Socket | Direct socket connection (recommended) |
+
+## Performance
+
+Based on benchmarks, the raw socket connection (port 2218) is approximately **28% faster** than RFC 2217 (port 2217). Use the socket connection for better performance.
+
+## Stopping the Container
+
+```bash
+# If running in foreground: Ctrl+C
+
+# If running in detached mode
+docker stop mpbridge
+```
+
+## View Logs
+
+```bash
+docker logs mpbridge
+```
+
 ## Build Arguments
 
 The Dockerfile supports build-time arguments to customize versions:
@@ -89,45 +154,4 @@ docker build \
 docker build \
   --build-arg BRIDGE_SCRIPT_URL=https://raw.githubusercontent.com/user/repo/branch/tools/mpremote_bridge.py \
   -t mpbridge:custom-script .
-```
-
-## Runtime Arguments
-
-Additional arguments can be passed to the mpremote_bridge.py script:
-
-```bash
-# Run with default arguments
-docker run --rm -p 2217:2217 -p 2218:2218 mpbridge
-
-# Pass custom arguments to the bridge script
-docker run --rm -p 2217:2217 -p 2218:2218 mpbridge /usr/local/bin/micropython --help
-
-# Run in detached mode (background)
-docker run --rm -d -p 2217:2217 -p 2218:2218 --name mpbridge mpbridge
-```
-
-## Ports
-
-| Port | Protocol | Description |
-|------|----------|-------------|
-| 2217 | RFC 2217 | Serial port emulation over TCP |
-| 2218 | Raw Socket | Direct socket connection (recommended) |
-
-## Performance
-
-Based on benchmarks, the raw socket connection (port 2218) is approximately **28% faster** than RFC 2217 (port 2217). Use the socket connection for better performance.
-
-## Stopping the Container
-
-```bash
-# If running in foreground: Ctrl+C
-
-# If running in detached mode
-docker stop mpbridge
-```
-
-## View Logs
-
-```bash
-docker logs mpbridge
 ```
