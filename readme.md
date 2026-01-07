@@ -25,6 +25,9 @@ docker build -t mpbridge .
 
 # Run the container
 docker run --rm -p 2217:2217 -p 2218:2218 mpbridge
+
+# Run in detached mode (background)
+docker run --rm -d -p 2217:2217 -p 2218:2218 --name mpbridge mpbridge
 ```
 
 ## Connecting
@@ -63,8 +66,6 @@ docker run --rm -p 2217:2217 -p 2218:2218 mpbridge
 # Pass custom arguments to the bridge script
 docker run --rm -p 2217:2217 -p 2218:2218 mpbridge /usr/local/bin/micropython --help
 
-# Run in detached mode (background)
-docker run --rm -d -p 2217:2217 -p 2218:2218 --name mpbridge mpbridge
 ```
 
 ## Mounting Local Folders
