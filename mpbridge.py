@@ -28,6 +28,7 @@
 # /// script
 # dependencies = [
 #   "pyserial >= 3.3",
+#   "pywinpty >= 2.0; sys_platform == 'win32'",
 # ]
 # ///
 
@@ -62,18 +63,45 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import pty
-import select
 import socket
 import subprocess
 import sys
 import threading
 import time
-import tty
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 from serial.rfc2217 import PortManager as RFC2217PortManager
+
+# Platform detection
+IS_WINDOWS = sys.platform == "win32"
+
+# Platform-specific imports for PTY functionality
+# These are conditionally imported based on platform
+if IS_WINDOWS:
+    try:
+        from winpty import PTY as WinPTY  # type: ignore[import-not-found]
+    except ImportError:
+        print(
+            "Error: pywinpty is required on Windows. Install with: pip install pywinpty",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # Windows uses selectors for socket operations (not PTY)
+    import selectors
+
+    # Stubs for type checker (Unix modules not available on Windows)
+    pty = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+    select = None  # type: ignore[assignment]
+else:
+    import pty
+    import select
+    import tty
+
+    # Stubs for type checker (Windows modules not available on Unix)
+    WinPTY = None  # type: ignore[misc,assignment]
+    selectors = None  # type: ignore[assignment]
 
 # Control character constants
 CTRL_A = b"\x01"  # Enter raw REPL
@@ -95,33 +123,344 @@ MP_BRIDGE_PROCESS_RESTART_DELAY = 0.01  # Delay after restarting process (10ms)
 MP_BRIDGE_POLL_INTERVAL = 1  # Status line poll interval
 MP_BRIDGE_READ_TIMEOUT = 0.01  # Read timeout for PTY (10ms for responsiveness)
 MP_BRIDGE_READ_BUFFER_SIZE = 4096  # Read buffer size for PTY
+# Windows-specific: longer delays needed for process startup
+MP_BRIDGE_WINDOWS_RESTART_DELAY = 0.1  # Extra delay for Windows process restart (100ms)
+MP_BRIDGE_DRAIN_TIMEOUT = 0.05  # Timeout per drain iteration (50ms)
 
-# Type alias for restart callback
-RestartCallback = Callable[[], Optional[Tuple[int, subprocess.Popen]]]
+
+# =============================================================================
+# Cross-platform PTY abstraction
+# =============================================================================
+
+
+class BasePTYProcess(ABC):
+    """Abstract base class for platform-specific PTY process wrappers."""
+
+    @abstractmethod
+    def read(self, size: int = MP_BRIDGE_READ_BUFFER_SIZE, timeout: float = MP_BRIDGE_READ_TIMEOUT) -> bytes:
+        """Read up to size bytes from the PTY with timeout."""
+        pass
+
+    @abstractmethod
+    def write(self, data: bytes) -> int:
+        """Write data to the PTY. Returns number of bytes written."""
+        pass
+
+    @abstractmethod
+    def poll(self) -> Optional[int]:
+        """Check if process has exited. Returns exit code or None if still running."""
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Close the PTY and terminate the process."""
+        pass
+
+    @abstractmethod
+    def is_alive(self) -> bool:
+        """Check if the process is still running."""
+        pass
+
+    @property
+    @abstractmethod
+    def process(self) -> Optional[subprocess.Popen]:
+        """Return the underlying Popen object if available."""
+        pass
+
+
+if IS_WINDOWS:
+
+    class WindowsPTYProcess(BasePTYProcess):
+        """Windows PTY implementation using pywinpty."""
+
+        def __init__(self, cmd: list[str], cwd: Optional[str] = None) -> None:
+            """Create a new PTY process on Windows.
+
+            Args:
+                cmd: Command and arguments to run
+                cwd: Working directory for the process
+            """
+            self._log = logging.getLogger("pty.windows")
+            self._closed = False
+            self._process: Optional[subprocess.Popen] = None
+
+            # Create Windows PTY with default terminal size
+            self._pty = WinPTY(80, 25)  # type: ignore[misc]
+
+            # Build command string for Windows
+            cmd_str = subprocess.list2cmdline(cmd)
+            self._log.debug(f"Spawning: {cmd_str}")
+
+            # Spawn the process
+            if cwd:
+                self._pty.spawn(cmd_str, cwd=cwd)
+            else:
+                self._pty.spawn(cmd_str)
+
+            # MicroPython Windows port sends DA1 terminal query (ESC [ c) on startup
+            # and waits for a response before showing the REPL prompt.
+            # We need to send a VT100 terminal response to unlock it.
+            # ESC [ ? 1 ; 0 c = "I am a VT101 with no options"
+            time.sleep(0.1)  # Brief wait for MicroPython to initialize
+            self._pty.write("\x1b[?1;0c")
+            self._log.debug("Sent DA1 terminal response to unlock MicroPython")
+
+        def _filter_escape_sequences(self, data: bytes) -> bytes:
+            """Filter out terminal escape sequences that Windows MicroPython sends.
+            
+            Windows MicroPython sends various terminal queries/modes that interfere
+            with the REPL protocol:
+            - ESC [ c       - DA1 (Device Attributes) query
+            - ESC [ 1 t     - Window manipulation (de-iconify)
+            - ESC [ ? 1004 h - Enable focus reporting
+            - ESC [ ? 9001 h - Enable Win32 input mode
+            
+            We respond to DA1 at startup, but need to filter all of these from
+            the data stream so they don't interfere with mpremote protocol.
+            """
+            import re
+            # Match ANSI escape sequences: ESC [ ... final_byte
+            # This covers CSI sequences (ESC [) with parameters and intermediate bytes
+            pattern = rb'\x1b\[[0-9;?]*[a-zA-Z]'
+            filtered = re.sub(pattern, b'', data)
+            if filtered != data:
+                self._log.debug(f"Filtered escape sequences: {len(data)} -> {len(filtered)} bytes")
+            return filtered
+
+        def read(self, size: int = MP_BRIDGE_READ_BUFFER_SIZE, timeout: float = MP_BRIDGE_READ_TIMEOUT) -> bytes:
+            """Read from the Windows PTY with timeout.
+            
+            Note: pywinpty 3.x read() doesn't take a size parameter.
+            It returns all available data as a string.
+            
+            Windows ConPTY adds extra CR characters, producing \r\r\n instead of \r\n.
+            We normalize these to \r\n so mpremote protocol parsing works correctly.
+            
+            We also filter out terminal escape sequences that Windows MicroPython sends.
+            
+            Encoding: pywinpty returns Unicode strings (ConPTY is Unicode-aware).
+            We encode to UTF-8 for proper Unicode character support.
+            """
+            if self._closed:
+                return b""
+            try:
+                # pywinpty read() returns str, not bytes, and doesn't take size
+                data = self._pty.read(blocking=False)
+                if data:
+                    # Convert string to bytes using UTF-8 for proper Unicode support
+                    result = data.encode("utf-8", errors="surrogateescape")
+                    # Windows ConPTY produces \r\r\n, normalize to \r\n
+                    result = result.replace(b"\r\r\n", b"\r\n")
+                    # Filter out escape sequences
+                    result = self._filter_escape_sequences(result)
+                    if result:
+                        self._log.debug(f"Read {len(result)} bytes: {result[:100]!r}")
+                    return result
+                # If no data, wait briefly and try again
+                time.sleep(timeout)
+                data = self._pty.read(blocking=False)
+                if data:
+                    result = data.encode("utf-8", errors="surrogateescape")
+                    # Windows ConPTY produces \r\r\n, normalize to \r\n
+                    result = result.replace(b"\r\r\n", b"\r\n")
+                    # Filter out escape sequences
+                    result = self._filter_escape_sequences(result)
+                    if result:
+                        self._log.debug(f"Read (after wait) {len(result)} bytes: {result[:100]!r}")
+                    return result
+                return b""
+            except Exception as e:
+                self._log.debug(f"Read error: {e}")
+                return b""
+
+        def write(self, data: bytes) -> int:
+            """Write to the Windows PTY.
+            
+            Note: pywinpty 3.x write() expects a string, not bytes.
+            
+            Encoding: We decode bytes using UTF-8 for proper Unicode support.
+            """
+            if self._closed:
+                return 0
+            try:
+                # pywinpty write() expects string - decode as UTF-8
+                text = data.decode("utf-8", errors="surrogateescape")
+                self._log.debug(f"Write {len(data)} bytes: {data[:100]!r}")
+                return self._pty.write(text)
+            except Exception as e:
+                self._log.debug(f"Write error: {e}")
+                return 0
+
+        def poll(self) -> Optional[int]:
+            """Check if process has exited."""
+            if self._closed:
+                return 0
+            try:
+                alive = self._pty.isalive()
+                if not alive:
+                    exit_status = self._pty.get_exitstatus()
+                    self._log.debug(f"poll(): process not alive, exit_status={exit_status}")
+                    return exit_status
+                return None  # Still running
+            except Exception as e:
+                self._log.debug(f"poll() exception: {e}")
+                return 0
+
+        def is_alive(self) -> bool:
+            """Check if the process is still running."""
+            result = self.poll() is None
+            if not result:
+                self._log.debug("is_alive(): False")
+            return result
+
+        def close(self) -> None:
+            """Close the Windows PTY."""
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                # pywinpty cleanup
+                del self._pty
+            except Exception:
+                pass
+
+        @property
+        def process(self) -> Optional[subprocess.Popen]:
+            """Windows PTY doesn't expose a Popen object."""
+            return None
+
+    # Set the platform PTYProcess class
+    PTYProcess = WindowsPTYProcess
+
+else:
+
+    class UnixPTYProcess(BasePTYProcess):
+        """Unix PTY implementation using pty module."""
+
+        def __init__(self, cmd: list[str], cwd: Optional[str] = None) -> None:
+            """Create a new PTY process on Unix.
+
+            Args:
+                cmd: Command and arguments to run
+                cwd: Working directory for the process
+            """
+            self._log = logging.getLogger("pty.unix")
+            self._closed = False
+
+            # Create pseudo-terminal
+            master_fd, slave_fd = pty.openpty()  # type: ignore[union-attr]
+
+            # Set terminal to raw mode
+            try:
+                tty.setraw(master_fd)  # type: ignore[union-attr]
+            except (OSError, Exception):  # tty.error doesn't exist on Windows
+                pass
+
+            # Spawn the process
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=cwd,
+                close_fds=False,
+            )
+
+            # Close slave in parent
+            os.close(slave_fd)
+            self._fd = master_fd
+
+        def read(self, size: int = MP_BRIDGE_READ_BUFFER_SIZE, timeout: float = MP_BRIDGE_READ_TIMEOUT) -> bytes:
+            """Read from the Unix PTY with timeout."""
+            if self._closed:
+                return b""
+            try:
+                ready, _, _ = select.select([self._fd], [], [], timeout)  # type: ignore[union-attr]
+                if ready:
+                    return os.read(self._fd, size)
+                return b""
+            except (OSError, ValueError):
+                self._closed = True
+                return b""
+
+        def write(self, data: bytes) -> int:
+            """Write to the Unix PTY."""
+            if self._closed:
+                return 0
+            try:
+                return os.write(self._fd, data)
+            except (OSError, ValueError):
+                self._closed = True
+                return 0
+
+        def poll(self) -> Optional[int]:
+            """Check if process has exited."""
+            if self._process is None:
+                return 0
+            return self._process.poll()
+
+        def close(self) -> None:
+            """Close the Unix PTY and terminate process."""
+            if self._closed:
+                return
+            self._closed = True
+
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+
+            if self._process and self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait()
+
+        def is_alive(self) -> bool:
+            """Check if the process is still running."""
+            return self.poll() is None
+
+        @property
+        def process(self) -> Optional[subprocess.Popen]:
+            """Return the underlying Popen object."""
+            return self._process
+
+        @property
+        def fd(self) -> int:
+            """Return the file descriptor (Unix only)."""
+            return self._fd
+
+    # Set the platform PTYProcess class
+    PTYProcess = UnixPTYProcess
+
+
+# Type alias for restart callback (now returns PTYProcess)
+RestartCallback = Callable[[], Optional[BasePTYProcess]]
 
 
 class VirtualSerialPort:
     """
-    A virtual serial port that wraps a PTY file descriptor.
+    A virtual serial port that wraps a PTYProcess.
     This simulates a serial port interface for the RFC 2217 PortManager.
     Emulates soft reboot behavior for compatibility with mpremote.
     """
 
     def __init__(
         self,
-        fd: int,
+        pty_process: BasePTYProcess,
         timeout: float = MP_BRIDGE_READ_TIMEOUT,
         restart_callback: Optional[RestartCallback] = None,
     ) -> None:
-        """Initialize with a PTY file descriptor.
+        """Initialize with a PTYProcess.
 
         Args:
-            fd: File descriptor for the PTY master
+            pty_process: Platform-specific PTY process wrapper
             timeout: Read timeout in seconds
             restart_callback: Optional callback to restart the process for soft reboot
         """
-        self.fd = fd
-        self.process: Optional[subprocess.Popen] = None
+        self._pty_process = pty_process
         self.timeout = timeout
         self.in_waiting = 0
         self.restart_callback = restart_callback
@@ -151,9 +490,19 @@ class VirtualSerialPort:
         self._settings_backup = None
         self.name = "MicroPython REPL (subprocess)"
 
+    @property
+    def pty_process(self) -> BasePTYProcess:
+        """Return the PTY process wrapper."""
+        return self._pty_process
+
+    @pty_process.setter
+    def pty_process(self, value: BasePTYProcess) -> None:
+        """Set the PTY process wrapper."""
+        self._pty_process = value
+
     def has_process_exited(self) -> bool:
         """Check if the MicroPython process has exited."""
-        return self.process is not None and self.process.poll() is not None
+        return not self._pty_process.is_alive()
 
     def can_restart(self) -> bool:
         """Check if the process can be restarted."""
@@ -165,7 +514,7 @@ class VirtualSerialPort:
             return False
         result = self.restart_callback()
         if result:
-            self.fd, self.process = result
+            self._pty_process = result
             self.in_raw_repl = False
             self.closed = False
             return True
@@ -183,12 +532,11 @@ class VirtualSerialPort:
             return b""
 
         try:
-            ready, _, _ = select.select([self.fd], [], [], self.timeout)
-            if ready:
-                data = os.read(self.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+            data = self._pty_process.read(size, self.timeout)
+            if data:
                 self._update_raw_repl_state_from_response(data)
-                return data
-        except (OSError, ValueError):
+            return data
+        except Exception:
             self.closed = True
         return b""
 
@@ -213,8 +561,8 @@ class VirtualSerialPort:
         self._log.debug(f"write({len(data)} bytes): {data!r}")
 
         try:
-            return os.write(self.fd, data)
-        except (OSError, ValueError):
+            return self._pty_process.write(data)
+        except Exception:
             self.closed = True
             return 0
 
@@ -224,10 +572,17 @@ class VirtualSerialPort:
             if self.closed:
                 self.in_waiting = 0
                 return
+            # Try a non-blocking read to check if data is available
             try:
-                ready, _, _ = select.select([self.fd], [], [], 0)
-                self.in_waiting = 1 if ready else 0
-            except (OSError, ValueError):
+                # Use a very short timeout to check for data
+                data = self._pty_process.read(1, timeout=0.001)
+                if data:
+                    # Put data back into pending buffer
+                    self.pending_reboot_output = data + self.pending_reboot_output
+                    self.in_waiting = 1
+                else:
+                    self.in_waiting = 0
+            except Exception:
                 self.closed = True
                 self.in_waiting = 0
 
@@ -287,6 +642,7 @@ class BaseRedirector(ABC):
         self._write_lock = threading.Lock()
         self.log = logging.getLogger(self._get_logger_name())
         self.alive = False
+        self._restarting = False  # Flag to pause writer during restart
 
     @abstractmethod
     def _get_logger_name(self) -> str:
@@ -350,21 +706,24 @@ class BaseRedirector(ABC):
         if not self.serial.has_process_exited():
             return False
 
-        self.log.info("MicroPython process exited - performing auto-restart (soft reboot)")
-        was_in_raw_repl = self.serial.in_raw_repl
-        self.log.debug(f"was_in_raw_repl = {was_in_raw_repl}")
-
-        # Send early soft reboot message if NOT in raw REPL
-        if not was_in_raw_repl:
-            self._safe_send(MPREMOTE_SOFT_REBOOT)
-
-        # Restart the process
-        if not self.serial.can_restart():
-            self.log.error("No restart callback available")
-            self.alive = False
-            return False
-
+        # Pause the writer thread during restart
+        self._restarting = True
+        
         try:
+            self.log.info("MicroPython process exited - performing auto-restart (soft reboot)")
+            was_in_raw_repl = self.serial.in_raw_repl
+            self.log.debug(f"was_in_raw_repl = {was_in_raw_repl}")
+
+            # Send early soft reboot message if NOT in raw REPL
+            if not was_in_raw_repl:
+                self._safe_send(MPREMOTE_SOFT_REBOOT)
+
+            # Restart the process
+            if not self.serial.can_restart():
+                self.log.error("No restart callback available")
+                self.alive = False
+                return False
+
             if not self.serial.do_restart():
                 self.log.error("Process restart returned no result")
                 self.alive = False
@@ -378,10 +737,15 @@ class BaseRedirector(ABC):
             self.log.error(f"Process restart failed: {e}")
             self.alive = False
             return False
+        finally:
+            # Resume the writer thread
+            self._restarting = False
 
     def _complete_restart(self, was_in_raw_repl: bool) -> None:
         """Complete the restart by reading banner and optionally re-entering raw REPL."""
-        time.sleep(MP_BRIDGE_PROCESS_RESTART_DELAY)
+        # Use longer delay on Windows where process startup is slower
+        delay = MP_BRIDGE_WINDOWS_RESTART_DELAY if IS_WINDOWS else MP_BRIDGE_PROCESS_RESTART_DELAY
+        time.sleep(delay)
 
         # Read and optionally forward the banner
         banner = self._read_banner()
@@ -394,33 +758,72 @@ class BaseRedirector(ABC):
     def _read_banner(self) -> bytes:
         """Read the startup banner from MicroPython."""
         try:
-            ready, _, _ = select.select([self.serial.fd], [], [], MP_BRIDGE_BANNER_READ_TIMEOUT)
-            if ready:
-                banner = os.read(self.serial.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+            banner = self.serial.pty_process.read(MP_BRIDGE_READ_BUFFER_SIZE, MP_BRIDGE_BANNER_READ_TIMEOUT)
+            if banner:
                 self.log.debug(f"Read banner: {banner!r}")
-                return banner
-        except OSError as e:
+            return banner
+        except Exception as e:
             self.log.error(f"Error reading banner: {e}")
         return b""
 
     def _reenter_raw_repl(self) -> None:
-        """Re-enter raw REPL mode after process restart."""
+        """Re-enter raw REPL mode after process restart.
+        
+        Drains all MicroPython output until we see the raw REPL prompt,
+        then sends a fabricated soft reboot response to the client.
+        """
         self.log.info("Re-entering raw REPL mode after soft reboot")
         try:
-            os.write(self.serial.fd, CTRL_A)
-            time.sleep(MP_BRIDGE_RAW_REPL_ENTRY_DELAY)
-
-            # Read and discard the raw REPL response
-            ready, _, _ = select.select([self.serial.fd], [], [], MP_BRIDGE_BANNER_READ_TIMEOUT)
-            if ready:
-                raw_response = os.read(self.serial.fd, MP_BRIDGE_READ_BUFFER_SIZE)
-                self.log.debug(f"Raw REPL response: {raw_response!r}")
+            # Wait a bit for MicroPython to start outputting before sending Ctrl-A
+            time.sleep(MP_BRIDGE_DRAIN_TIMEOUT)
+            
+            self.serial.pty_process.write(CTRL_A)
+            
+            # Drain all output until we see the raw REPL prompt
+            # MicroPython sends: banner + ">>> " + "\r\n" + "raw REPL; CTRL-B to exit\r\n>"
+            accumulated = b""
+            max_attempts = 50  # Prevent infinite loop (~2.5 seconds max)
+            empty_reads = 0
+            max_empty_reads = 10 if IS_WINDOWS else 5  # Allow more empty reads on Windows
+            
+            for _ in range(max_attempts):
+                time.sleep(MP_BRIDGE_DRAIN_TIMEOUT)
+                chunk = self.serial.pty_process.read(MP_BRIDGE_READ_BUFFER_SIZE, MP_BRIDGE_DRAIN_TIMEOUT)
+                if chunk:
+                    accumulated += chunk
+                    empty_reads = 0  # Reset empty counter
+                    self.log.debug(f"Raw REPL drain: {chunk!r}")
+                    # Check if we've received the raw REPL prompt
+                    if b"raw REPL; CTRL-B to exit" in accumulated and accumulated.rstrip().endswith(b">"):
+                        self.log.debug("Found raw REPL prompt, drain complete")
+                        break
+                else:
+                    # Empty read - might be escape sequences being filtered, or data not ready yet
+                    empty_reads += 1
+                    if empty_reads > max_empty_reads and accumulated:
+                        # We have some data and no more coming
+                        break
+                    elif empty_reads > max_empty_reads * 2:
+                        # Give up even if no data
+                        break
+            
+            self.log.debug(f"Drained {len(accumulated)} bytes from MicroPython")
 
             # Send the expected soft reboot response to the client
+            self.log.debug(f"Sending soft reboot response to client: {MPREMOTE_RAW_REPL_SOFT_REBOOT!r}")
             self._safe_send(MPREMOTE_RAW_REPL_SOFT_REBOOT)
             self.serial.in_raw_repl = True
 
-        except OSError as e:
+        except Exception as e:
+            self.log.error(f"Error re-entering raw REPL: {e}")
+            self._safe_send(MPREMOTE_SOFT_REBOOT)
+
+            # Send the expected soft reboot response to the client
+            self.log.debug(f"Sending soft reboot response to client: {MPREMOTE_RAW_REPL_SOFT_REBOOT!r}")
+            self._safe_send(MPREMOTE_RAW_REPL_SOFT_REBOOT)
+            self.serial.in_raw_repl = True
+
+        except Exception as e:
             self.log.error(f"Error re-entering raw REPL: {e}")
             self._safe_send(MPREMOTE_SOFT_REBOOT)
 
@@ -443,6 +846,10 @@ class BaseRedirector(ABC):
         """Loop forever and copy socket -> subprocess input."""
         while self.alive:
             try:
+                # Wait while restart is in progress
+                while self._restarting and self.alive:
+                    time.sleep(0.01)
+                
                 data = self._receive_from_client()
                 if data is None:
                     break  # Connection closed
@@ -481,8 +888,9 @@ class Redirector(BaseRedirector):
     ) -> None:
         super().__init__(virtual_serial, socket_conn)
         # Note: PortManager expects a connection with write() method
+        # VirtualSerialPort is a duck-typed replacement for Serial
         self.rfc2217 = RFC2217PortManager(
-            self.serial,
+            self.serial,  # type: ignore[arg-type]
             self,  # type: ignore[arg-type]
             logger=logging.getLogger("rfc2217.server") if debug else None,
         )
@@ -708,9 +1116,14 @@ def setup_logging(verbosity: int) -> None:
     verbosity = min(verbosity, 3)
     level = (logging.WARNING, logging.INFO, logging.DEBUG, logging.NOTSET)[verbosity]
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     logging.getLogger("rfc2217").setLevel(level)
+    logging.getLogger("pty.windows").setLevel(level)
+    logging.getLogger("pty.unix").setLevel(level)
+    logging.getLogger("virtualserial").setLevel(level)
+    logging.getLogger("socket-redirector").setLevel(level)
+    logging.getLogger("redirector").setLevel(level)
 
 
 def build_micropython_command(args: argparse.Namespace) -> list[str]:
@@ -767,64 +1180,49 @@ class MicroPythonProcessManager:
     def __init__(self, cmd: list[str], cwd: Optional[str] = None) -> None:
         self.cmd = cmd
         self.cwd = cwd
-        self.master_fd: Optional[int] = None
-        self.process: Optional[subprocess.Popen] = None
+        self._pty_process: Optional[BasePTYProcess] = None
 
-    def create_process(self) -> Tuple[int, subprocess.Popen]:
+    def create_process(self) -> BasePTYProcess:
         """Create and return a new MicroPython process with PTY."""
-        # Close old master_fd if it exists
-        if self.master_fd is not None:
+        # Close old PTY process if it exists
+        if self._pty_process is not None:
             try:
-                os.close(self.master_fd)
-            except OSError:
+                self._pty_process.close()
+            except Exception:
                 pass
 
-        # Create a pseudo-terminal for the process
-        new_master_fd, new_slave_fd = pty.openpty()
+        # Create platform-specific PTY process
+        self._pty_process = PTYProcess(self.cmd, self.cwd)
+        return self._pty_process
 
-        # Set the terminal to raw mode to avoid line buffering
-        try:
-            tty.setraw(new_master_fd)
-        except (OSError, tty.error):
-            pass  # Ignore errors setting raw mode
-
-        self.process = subprocess.Popen(
-            self.cmd,
-            stdin=new_slave_fd,
-            stdout=new_slave_fd,
-            stderr=new_slave_fd,
-            cwd=self.cwd,
-            close_fds=False,
-        )
-
-        # Close the slave fd in the parent process
-        os.close(new_slave_fd)
-
-        self.master_fd = new_master_fd
-        return (new_master_fd, self.process)
-
-    def restart(self) -> Tuple[int, subprocess.Popen]:
+    def restart(self) -> BasePTYProcess:
         """Restart MicroPython process for soft reboot."""
         logging.info(f"Restarting MicroPython for soft reboot: {' '.join(self.cmd)}")
         return self.create_process()
 
     def cleanup(self) -> None:
         """Clean up resources on shutdown."""
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-
-        if self.process and self.process.poll() is None:
+        if self._pty_process is not None:
             logging.info("Terminating MicroPython process...")
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                logging.warning("MicroPython process did not terminate, killing...")
-                self.process.kill()
-                self.process.wait()
+            self._pty_process.close()
+
+
+def _socket_select(sockets: list, timeout: Optional[float] = None) -> list:
+    """Cross-platform socket select. Returns list of readable sockets."""
+    if IS_WINDOWS:
+        # Use selectors module on Windows
+        sel = selectors.DefaultSelector()  # type: ignore[union-attr]
+        try:
+            for sock in sockets:
+                sel.register(sock, selectors.EVENT_READ)  # type: ignore[union-attr]
+            events = sel.select(timeout=timeout)
+            return [key.fileobj for key, _ in events]
+        finally:
+            sel.close()
+    else:
+        # Use select on Unix
+        readable, _, _ = select.select(sockets, [], [], timeout)  # type: ignore[union-attr]
+        return readable
 
 
 def _reject_pending_connections(
@@ -836,7 +1234,7 @@ def _reject_pending_connections(
             continue
         # Check for pending connections without blocking
         try:
-            readable, _, _ = select.select([srv], [], [], 0)
+            readable = _socket_select([srv], timeout=0)
             if readable:
                 # Accept and immediately close with a message
                 try:
@@ -872,24 +1270,32 @@ def run_server_loop(
     """
     server_map = {srv: (proto, redir_cls) for srv, proto, redir_cls in servers}
     server_sockets = [srv for srv, _, _ in servers]
+    waiting_logged = False
 
     while True:
         try:
-            logging.info("Waiting for connection...")
-            readable, _, _ = select.select(server_sockets, [], [])
+            if not waiting_logged:
+                logging.info("Waiting for connection...")
+                waiting_logged = True
+            # Use timeout on Windows so Ctrl-C can interrupt
+            readable = _socket_select(server_sockets, timeout=1.0 if IS_WINDOWS else None)
+            
+            if not readable:
+                # Timeout - just continue loop (allows Ctrl-C check)
+                continue
 
             for srv in readable:
                 protocol_name, redirector_class = server_map[srv]
                 client_socket, addr = srv.accept()
                 logging.info(f"Connected via {protocol_name} by {addr[0]}:{addr[1]}")
+                waiting_logged = False  # Reset so we log again after disconnect
                 client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
                 # Check if process is still alive, restart if needed
                 if virtual_serial.has_process_exited():
                     logging.info("MicroPython process has exited, restarting...")
-                    fd, proc = process_manager.create_process()
-                    virtual_serial.fd = fd
-                    virtual_serial.process = proc
+                    new_pty = process_manager.create_process()
+                    virtual_serial.pty_process = new_pty
                     virtual_serial.closed = False
 
                 virtual_serial.reset_for_new_connection()
@@ -932,6 +1338,7 @@ def main() -> None:
 
     logging.info("mpremote Bridge - type Ctrl-C to quit")
     logging.info(f"MicroPython executable: {args.MICROPYTHON_PATH}")
+    logging.info(f"Platform: {'Windows' if IS_WINDOWS else 'Unix/POSIX'}")
     if args.cwd:
         logging.info(f"MicroPython working directory: {args.cwd}")
     if args.mp_verbose:
@@ -947,14 +1354,13 @@ def main() -> None:
 
     process_manager = MicroPythonProcessManager(cmd, args.cwd)
     logging.info(f"Starting MicroPython: {' '.join(cmd)}")
-    master_fd, process = process_manager.create_process()
+    pty_process = process_manager.create_process()
 
     virtual_serial = VirtualSerialPort(
-        master_fd,
+        pty_process,
         timeout=0.1,
         restart_callback=process_manager.restart,
     )
-    virtual_serial.process = process
 
     try:
         run_server_loop(servers, virtual_serial, process_manager, args.verbosity > 0)
