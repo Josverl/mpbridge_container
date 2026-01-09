@@ -67,6 +67,7 @@ import select
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
 import tty
@@ -98,6 +99,27 @@ MP_BRIDGE_READ_BUFFER_SIZE = 4096  # Read buffer size for PTY
 
 # Type alias for restart callback
 RestartCallback = Callable[[], Optional[Tuple[int, subprocess.Popen]]]
+
+
+def format_bytes_for_log(data: bytes) -> str:
+    """Format bytes for logging, showing printable chars and hex for control chars."""
+    parts = []
+    for b in data:
+        if b == 0x08:  # Backspace
+            parts.append("<BS>")
+        elif b == 0x7F:  # DEL
+            parts.append("<DEL>")
+        elif b == 0x0D:  # CR
+            parts.append("<CR>")
+        elif b == 0x0A:  # LF
+            parts.append("<LF>")
+        elif 0x20 <= b < 0x7F:  # Printable ASCII
+            parts.append(chr(b))
+        elif b < 0x20:  # Control characters
+            parts.append(f"<0x{b:02x}>")
+        else:
+            parts.append(f"<0x{b:02x}>")
+    return "".join(parts)
 
 
 class VirtualSerialPort:
@@ -177,6 +199,7 @@ class VirtualSerialPort:
         if self.pending_reboot_output:
             chunk = self.pending_reboot_output[:size]
             self.pending_reboot_output = self.pending_reboot_output[size:]
+            self._log.debug(f"read({size}) from pending: {format_bytes_for_log(chunk)}")
             return chunk
 
         if self.closed:
@@ -186,6 +209,7 @@ class VirtualSerialPort:
             ready, _, _ = select.select([self.fd], [], [], self.timeout)
             if ready:
                 data = os.read(self.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+                self._log.debug(f"read({size}) from PTY: {format_bytes_for_log(data)}")
                 self._update_raw_repl_state_from_response(data)
                 return data
         except (OSError, ValueError):
@@ -210,11 +234,14 @@ class VirtualSerialPort:
         elif CTRL_B in data:
             self.in_raw_repl = False
 
-        self._log.debug(f"write({len(data)} bytes): {data!r}")
+        self._log.debug(f"write({len(data)} bytes): {format_bytes_for_log(data)}")
 
         try:
-            return os.write(self.fd, data)
-        except (OSError, ValueError):
+            written = os.write(self.fd, data)
+            self._log.debug(f"write returned {written}")
+            return written
+        except (OSError, ValueError) as e:
+            self._log.error(f"write error: {e}")
             self.closed = True
             return 0
 
@@ -477,7 +504,10 @@ class Redirector(BaseRedirector):
     """
 
     def __init__(
-        self, virtual_serial: VirtualSerialPort, socket_conn: socket.socket, debug: bool = False
+        self,
+        virtual_serial: VirtualSerialPort,
+        socket_conn: socket.socket,
+        debug: bool = False,
     ) -> None:
         super().__init__(virtual_serial, socket_conn)
         # Note: PortManager expects a connection with write() method
@@ -540,14 +570,15 @@ class SocketRedirector(BaseRedirector):
     ) -> None:
         # debug parameter kept for API compatibility with Redirector
         super().__init__(serial, socket_conn)
-        # Silence unused parameter warning
-        _ = debug
+        self.debug = debug
 
     def _get_logger_name(self) -> str:
         return "socket-redirector"
 
     def _send_to_client(self, data: bytes) -> None:
         """Send data directly without escaping."""
+        if self.debug:
+            self.log.debug(f"PTY->Client ({len(data)} bytes): {format_bytes_for_log(data)}")
         self.write_to_socket(data)
 
     def _receive_from_client(self) -> Optional[bytes]:
@@ -555,6 +586,8 @@ class SocketRedirector(BaseRedirector):
         data = self.socket.recv(MP_BRIDGE_READ_BUFFER_SIZE)
         if not data:
             return None  # Connection closed
+        if self.debug:
+            self.log.debug(f"Client->PTY ({len(data)} bytes): {format_bytes_for_log(data)}")
         return data
 
 
@@ -707,10 +740,16 @@ def setup_logging(verbosity: int) -> None:
     """Configure logging based on verbosity level."""
     verbosity = min(verbosity, 3)
     level = (logging.WARNING, logging.INFO, logging.DEBUG, logging.NOTSET)[verbosity]
+    # Set root logger to DEBUG if high verbosity, so debug messages from our loggers appear
+    root_level = logging.DEBUG if verbosity >= 2 else logging.INFO
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=root_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+    # Set level for all relevant loggers
     logging.getLogger("rfc2217").setLevel(level)
+    logging.getLogger("virtualserial").setLevel(level)
+    logging.getLogger("socket-redirector").setLevel(level)
+    logging.getLogger("redirector").setLevel(level)
 
 
 def build_micropython_command(args: argparse.Namespace) -> list[str]:
@@ -770,6 +809,45 @@ class MicroPythonProcessManager:
         self.master_fd: Optional[int] = None
         self.process: Optional[subprocess.Popen] = None
 
+    def _configure_pty_raw(self, fd: int) -> None:
+        """Configure a PTY file descriptor for raw mode with no flow control.
+
+        This is more explicit than tty.setraw() and ensures:
+        - No XON/XOFF flow control (which can block on certain characters)
+        - No canonical mode (no line buffering)
+        - No echo
+        - No signal generation
+        """
+        try:
+            attrs = termios.tcgetattr(fd)
+            # Input modes: no break, no CR to NL, no parity check, no strip char,
+            # no start/stop output control
+            attrs[0] &= ~(
+                termios.BRKINT
+                | termios.ICRNL
+                | termios.INPCK
+                | termios.ISTRIP
+                | termios.IXON
+                | termios.IXOFF
+                | termios.IXANY
+            )
+            # Output modes: disable post processing
+            attrs[1] &= ~termios.OPOST
+            # Control modes: 8-bit chars
+            attrs[2] &= ~(termios.CSIZE | termios.PARENB)
+            attrs[2] |= termios.CS8
+            # Local modes: no echo, no canonical, no extended functions, no signal chars
+            attrs[3] &= ~(
+                termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN
+            )
+            # Control chars: set read to return immediately with any amount of data
+            attrs[6][termios.VMIN] = 1
+            attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            logging.debug(f"PTY fd {fd} configured for raw mode")
+        except (OSError, termios.error) as e:
+            logging.debug(f"Could not configure PTY fd {fd}: {e}")
+
     def create_process(self) -> Tuple[int, subprocess.Popen]:
         """Create and return a new MicroPython process with PTY."""
         # Close old master_fd if it exists
@@ -782,11 +860,10 @@ class MicroPythonProcessManager:
         # Create a pseudo-terminal for the process
         new_master_fd, new_slave_fd = pty.openpty()
 
-        # Set the terminal to raw mode to avoid line buffering
-        try:
-            tty.setraw(new_master_fd)
-        except (OSError, tty.error):
-            pass  # Ignore errors setting raw mode
+        # Configure both sides for raw mode with no flow control
+        # This prevents XON/XOFF and other terminal processing that could cause hangs
+        self._configure_pty_raw(new_master_fd)
+        self._configure_pty_raw(new_slave_fd)
 
         self.process = subprocess.Popen(
             self.cmd,
