@@ -90,11 +90,11 @@ MPREMOTE_RAW_REPL_SOFT_REBOOT = b"OK\r\nMPY: soft reboot\r\nraw REPL; CTRL-B to 
 # Bridge timing constants (in seconds)
 # Note: MicroPython unix port starts in ~2ms and responds to raw REPL in <1ms
 # These delays are safety margins, not performance requirements
-MP_BRIDGE_RAW_REPL_ENTRY_DELAY = 0.005  # Delay after sending Ctrl-A (5ms is plenty)
-MP_BRIDGE_BANNER_READ_TIMEOUT = 0.05  # Timeout for reading banner (50ms max)
-MP_BRIDGE_PROCESS_RESTART_DELAY = 0.01  # Delay after restarting process (10ms)
+MP_BRIDGE_RAW_REPL_ENTRY_DELAY = 0.0001  # Delay after sending Ctrl-A (0.1ms)
+MP_BRIDGE_BANNER_READ_TIMEOUT = 0.001  # Timeout for reading banner (1ms)
+MP_BRIDGE_PROCESS_RESTART_DELAY = 0.0001  # Delay after restarting process (0.1ms)
 MP_BRIDGE_POLL_INTERVAL = 1  # Status line poll interval
-MP_BRIDGE_READ_TIMEOUT = 0.01  # Read timeout for PTY (10ms for responsiveness)
+MP_BRIDGE_READ_TIMEOUT = 0.001  # Read timeout for PTY (1ms - balance responsiveness vs CPU)
 MP_BRIDGE_READ_BUFFER_SIZE = 4096  # Read buffer size for PTY
 
 # Type alias for restart callback
@@ -152,6 +152,9 @@ class VirtualSerialPort:
         self.closed = False
         self._check_buffer_lock = threading.Lock()
         self._log = logging.getLogger("virtualserial")
+        # Optimization: Read buffer to reduce select() calls
+        self._read_buffer = bytearray()
+        self._max_buffer_size = 8192
 
         # Simulate serial port settings (stored but not used for PTY)
         self.baudrate = 115200
@@ -194,7 +197,7 @@ class VirtualSerialPort:
         return False
 
     def read(self, size: int = MP_BRIDGE_READ_BUFFER_SIZE) -> bytes:
-        """Read up to size bytes from the PTY."""
+        """Read up to size bytes from the PTY with buffering optimization."""
         # If we have pending reboot output, return that first
         if self.pending_reboot_output:
             chunk = self.pending_reboot_output[:size]
@@ -206,13 +209,31 @@ class VirtualSerialPort:
             return b""
 
         try:
+            # If buffer has data, return immediately (reduces select calls)
+            if self._read_buffer:
+                chunk = bytes(self._read_buffer[:size])
+                self._read_buffer = self._read_buffer[size:]
+                return chunk
+
+            # Try to fill buffer opportunistically
             ready, _, _ = select.select([self.fd], [], [], self.timeout)
             if ready:
-                data = os.read(self.fd, MP_BRIDGE_READ_BUFFER_SIZE)
-                self._log.debug(f"read({size}) from PTY: {format_bytes_for_log(data)}")
+                # Read more data to reduce future select calls
+                data = os.read(self.fd, self._max_buffer_size)
+                if not data:
+                    # EOF on PTY
+                    self.closed = True
+                    return b""
+                self._log.debug(f"read() buffered {len(data)} bytes from PTY")
                 self._update_raw_repl_state_from_response(data)
-                return data
-        except (OSError, ValueError):
+                self._read_buffer.extend(data)
+
+                # Return requested amount
+                chunk = bytes(self._read_buffer[:size])
+                self._read_buffer = self._read_buffer[size:]
+                return chunk
+        except (OSError, ValueError) as e:
+            self._log.debug(f"PTY read error (normal during process restart): {e}")
             self.closed = True
         return b""
 
@@ -281,12 +302,26 @@ class VirtualSerialPort:
         self.xonxoff = settings.get("xonxoff", self.xonxoff)
 
     def reset_input_buffer(self) -> None:
-        """Reset input buffer (no-op for subprocess)."""
-        pass
+        """Reset input buffer by draining any pending PTY data."""
+        self.pending_reboot_output = b""
+        self._read_buffer = bytearray()  # Clear optimization buffer
+        if self.closed:
+            self.in_waiting = 0
+            return
+
+        try:
+            while True:
+                ready, _, _ = select.select([self.fd], [], [], 0)
+                if not ready:
+                    break
+                os.read(self.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+        except (OSError, ValueError):
+            self.closed = True
+        self.in_waiting = 0
 
     def reset_output_buffer(self) -> None:
-        """Reset output buffer (no-op for subprocess)."""
-        pass
+        """Reset output buffer (no queued writes for PTY)."""
+        self.pending_reboot_output = b""
 
     def send_break(self, duration: float = 0.25) -> None:
         """Send break condition (no-op for subprocess)."""
@@ -300,6 +335,7 @@ class VirtualSerialPort:
         """Reset state for a new client connection."""
         self.in_raw_repl = False
         self.pending_reboot_output = b""
+        self._read_buffer = bytearray()  # Clear optimization buffer
 
 
 class BaseRedirector(ABC):
@@ -338,6 +374,8 @@ class BaseRedirector(ABC):
     def shortcircuit(self) -> None:
         """Connect the subprocess to the TCP port by copying data bidirectionally."""
         self.alive = True
+        # Set socket to non-blocking mode (like pyserial does)
+        self.socket.setblocking(False)
         self.thread_read = threading.Thread(target=self.reader)
         self.thread_read.daemon = True
         self.thread_read.name = f"{self._get_logger_name()}:reader"
@@ -352,14 +390,20 @@ class BaseRedirector(ABC):
     def reader(self) -> None:
         """Loop forever and copy subprocess output -> socket."""
         self.log.debug("reader thread started")
+        empty_reads = 0
         while self.alive:
             try:
-                if self._handle_process_exit():
-                    continue  # Process was restarted, continue loop
-
                 data = self.serial.read(MP_BRIDGE_READ_BUFFER_SIZE)
                 if data:
                     self._send_to_client(data)
+                    empty_reads = 0
+                else:
+                    empty_reads += 1
+                    # Only check process status after multiple empty reads (optimization)
+                    if empty_reads >= 10:
+                        if self._handle_process_exit():
+                            empty_reads = 0
+                            continue  # Process was restarted, continue loop
             except socket.error as e:
                 self.log.error(f"Socket error in reader: {e}")
                 break
@@ -475,6 +519,9 @@ class BaseRedirector(ABC):
                     break  # Connection closed
                 if data:  # Only write if there's data after filtering
                     self.serial.write(data)
+                else:
+                    # No data available, brief sleep to avoid CPU spinning
+                    time.sleep(0.0001)  # 0.1ms sleep when idle
             except socket.error as e:
                 self.log.error(f"Socket error in writer: {e}")
                 break
@@ -526,12 +573,23 @@ class Redirector(BaseRedirector):
         self.write_to_socket(escaped)
 
     def _receive_from_client(self) -> Optional[bytes]:
-        """Receive data and filter RFC 2217 control sequences."""
-        data = self.socket.recv(1024)
-        if not data:
-            return None  # Connection closed
-        filtered = b"".join(self.rfc2217.filter(data))
-        return filtered  # May be empty if all control sequences
+        """Receive data and filter RFC 2217 control sequences, using non-blocking I/O."""
+        # Use select() with moderate timeout
+        ready, _, _ = select.select([self.socket], [], [], 0.01)  # 10ms timeout
+        if not ready:
+            return b""  # No data available
+
+        try:
+            data = self.socket.recv(1024)
+            if not data:
+                return None  # Connection closed
+            filtered = b"".join(self.rfc2217.filter(data))
+            return filtered  # May be empty if all control sequences
+        except BlockingIOError:
+            return b""  # Would block, no data
+        except Exception as e:
+            self.log.error(f"Socket recv error: {e}")
+            return None  # Error, treat as closed
 
     def _start_additional_threads(self) -> None:
         """Start the modem status line polling thread."""
@@ -561,8 +619,8 @@ class Redirector(BaseRedirector):
 
 class SocketRedirector(BaseRedirector):
     """
-    Simple socket redirector - direct byte pass-through without RFC 2217 overhead.
-    Much faster than RFC 2217 for local connections.
+    Event-driven socket redirector using single select() on both PTY and socket.
+    This eliminates thread synchronization overhead and reduces latency significantly.
     """
 
     def __init__(
@@ -575,20 +633,196 @@ class SocketRedirector(BaseRedirector):
     def _get_logger_name(self) -> str:
         return "socket-redirector"
 
+    def shortcircuit(self) -> None:
+        """Event-driven loop: use select() on both PTY and socket simultaneously."""
+        self.alive = True
+        self.socket.setblocking(False)
+        self.log.debug("Starting optimized event-driven I/O loop")
+
+        # Event-driven loop with proper blocking I/O
+        while self.alive:
+            try:
+                # Wait for data on EITHER socket or PTY with single select()
+                # Use 100ms timeout to balance responsiveness with efficiency
+                # This reduces excessive polling while maintaining low latency
+                readable, _, exceptional = select.select(
+                    [self.socket, self.serial.fd],
+                    [],
+                    [self.socket, self.serial.fd],
+                    0.1,  # 100ms timeout - optimal balance
+                )
+
+                # Check for socket errors
+                if self.socket in exceptional:
+                    self.log.error("Socket error detected")
+                    break
+
+                # Check for PTY errors
+                if self.serial.fd in exceptional:
+                    self.log.error("PTY error detected")
+                    break
+
+                # Read from socket -> write to PTY
+                if self.socket in readable:
+                    try:
+                        # Read larger chunks to reduce syscalls
+                        data = self.socket.recv(8192)
+                        if not data:
+                            self.log.info("Socket closed by client")
+                            break  # Connection closed
+                        if self.debug:
+                            self.log.debug(
+                                f"Client->PTY ({len(data)} bytes): {format_bytes_for_log(data)}"
+                            )
+                        self.serial.write(data)
+                    except BlockingIOError:
+                        pass  # No data available
+                    except Exception as e:
+                        self.log.error(f"Socket recv error: {e}")
+                        break
+
+                # Read from PTY -> write to socket
+                if self.serial.fd in readable:
+                    try:
+                        # Read larger chunks to reduce syscalls
+                        data = os.read(self.serial.fd, 8192)
+                        if not data:
+                            # PTY closed (process exited)
+                            if self._handle_process_exit():
+                                continue  # Process restarted, continue loop
+                            break
+                        if self.debug:
+                            self.log.debug(
+                                f"PTY->Client ({len(data)} bytes): {format_bytes_for_log(data)}"
+                            )
+                        self.serial._update_raw_repl_state_from_response(data)
+                        self.socket.sendall(data)
+                    except (OSError, ValueError) as e:
+                        self.log.debug(f"PTY read error: {e}")
+                        # Check if process exited
+                        if self._handle_process_exit():
+                            continue  # Process restarted, continue loop
+                        break
+                    except Exception as e:
+                        self.log.error(f"Socket send error: {e}")
+                        break
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.log.error(f"Event loop error: {e}")
+                break
+
+        self.alive = False
+        self.log.debug("Event-driven I/O loop terminated")
+
+    def _handle_process_exit(self) -> bool:
+        """
+        Handle MicroPython process exit (soft reboot).
+        Returns True if process was restarted and loop should continue.
+        """
+        if not self.serial.has_process_exited():
+            return False
+
+        self.log.info("MicroPython process exited - performing auto-restart (soft reboot)")
+        was_in_raw_repl = self.serial.in_raw_repl
+        self.log.debug(f"was_in_raw_repl = {was_in_raw_repl}")
+
+        # Send early soft reboot message if NOT in raw REPL
+        if not was_in_raw_repl:
+            try:
+                self.socket.sendall(MPREMOTE_SOFT_REBOOT)
+            except:
+                pass
+
+        # Restart the process
+        if not self.serial.can_restart():
+            self.log.error("No restart callback available")
+            self.alive = False
+            return False
+
+        try:
+            if not self.serial.do_restart():
+                self.log.error("Process restart returned no result")
+                self.alive = False
+                return False
+
+            self.log.info("Process restarted successfully")
+            self._complete_restart(was_in_raw_repl)
+            return True
+
+        except Exception as e:
+            self.log.error(f"Process restart failed: {e}")
+            self.alive = False
+            return False
+
+    def _complete_restart(self, was_in_raw_repl: bool) -> None:
+        """Complete the restart by reading banner and optionally re-entering raw REPL."""
+        time.sleep(MP_BRIDGE_PROCESS_RESTART_DELAY)
+
+        # Read and optionally forward the banner
+        banner = self._read_banner()
+
+        if was_in_raw_repl:
+            self._reenter_raw_repl()
+        elif banner:
+            try:
+                self.socket.sendall(banner)
+            except:
+                pass
+
+    def _read_banner(self) -> bytes:
+        """Read the startup banner from MicroPython."""
+        try:
+            ready, _, _ = select.select([self.serial.fd], [], [], MP_BRIDGE_BANNER_READ_TIMEOUT)
+            if ready:
+                banner = os.read(self.serial.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+                self.log.debug(f"Read banner: {banner!r}")
+                return banner
+        except OSError as e:
+            self.log.error(f"Error reading banner: {e}")
+        return b""
+
+    def _reenter_raw_repl(self) -> None:
+        """Re-enter raw REPL mode after process restart."""
+        self.log.info("Re-entering raw REPL mode after soft reboot")
+        try:
+            os.write(self.serial.fd, CTRL_A)
+            time.sleep(MP_BRIDGE_RAW_REPL_ENTRY_DELAY)
+
+            # Read and discard the raw REPL response
+            ready, _, _ = select.select([self.serial.fd], [], [], MP_BRIDGE_BANNER_READ_TIMEOUT)
+            if ready:
+                raw_response = os.read(self.serial.fd, MP_BRIDGE_READ_BUFFER_SIZE)
+                self.log.debug(f"Raw REPL response: {raw_response!r}")
+
+            # Send the expected soft reboot response to the client
+            try:
+                self.socket.sendall(MPREMOTE_RAW_REPL_SOFT_REBOOT)
+            except:
+                pass
+            self.serial.in_raw_repl = True
+
+        except OSError as e:
+            self.log.error(f"Error re-entering raw REPL: {e}")
+            try:
+                self.socket.sendall(MPREMOTE_SOFT_REBOOT)
+            except:
+                pass
+
+    def stop(self) -> None:
+        """Stop the event loop."""
+        self.log.debug("stopping")
+        self.alive = False
+
+    # These methods are no longer used in event-driven model but kept for compatibility
     def _send_to_client(self, data: bytes) -> None:
-        """Send data directly without escaping."""
-        if self.debug:
-            self.log.debug(f"PTY->Client ({len(data)} bytes): {format_bytes_for_log(data)}")
-        self.write_to_socket(data)
+        """Legacy method - not used in event-driven model."""
+        pass
 
     def _receive_from_client(self) -> Optional[bytes]:
-        """Receive data directly without filtering."""
-        data = self.socket.recv(MP_BRIDGE_READ_BUFFER_SIZE)
-        if not data:
-            return None  # Connection closed
-        if self.debug:
-            self.log.debug(f"Client->PTY ({len(data)} bytes): {format_bytes_for_log(data)}")
-        return data
+        """Legacy method - not used in event-driven model."""
+        return None
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -959,7 +1193,13 @@ def run_server_loop(
                 protocol_name, redirector_class = server_map[srv]
                 client_socket, addr = srv.accept()
                 logging.info(f"Connected via {protocol_name} by {addr[0]}:{addr[1]}")
+                # Set TCP options for minimum latency
                 client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                try:
+                    # TCP_QUICKACK: send ACKs immediately (Linux-specific)
+                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                except (AttributeError, OSError):
+                    pass  # Not available on all platforms
 
                 # Check if process is still alive, restart if needed
                 if virtual_serial.has_process_exited():
@@ -1028,7 +1268,6 @@ def main() -> None:
 
     virtual_serial = VirtualSerialPort(
         master_fd,
-        timeout=0.1,
         restart_callback=process_manager.restart,
     )
     virtual_serial.process = process
