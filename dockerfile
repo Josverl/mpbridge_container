@@ -1,11 +1,14 @@
 # Build arguments for version configuration
 ARG MICROPYTHON_VERSION=v1.27.0
 ARG PYTHON_VERSION=3.12
+ARG BRIDGE_VERSION=1.27.0.1
 
 FROM micropython/unix:${MICROPYTHON_VERSION}
 
 # Re-declare ARGs after FROM (they go out of scope)
+ARG MICROPYTHON_VERSION=v1.27.0
 ARG PYTHON_VERSION=3.12
+ARG BRIDGE_VERSION=1.27.0.1
 
 WORKDIR /bridge
 
@@ -31,8 +34,10 @@ COPY mpbridge.py /bridge/mpbridge.py
 # Copy readme into the image
 COPY readme.md /bridge/readme.md
 
-# Store Python version as environment variable for runtime
+# Store versions as environment variables for runtime
+ENV MICROPYTHON_VERSION=${MICROPYTHON_VERSION}
 ENV PYTHON_VERSION=${PYTHON_VERSION}
+ENV BRIDGE_VERSION=${BRIDGE_VERSION}
 ENV MICROPYTHON_PATH=/usr/local/bin/micropython
 
 # Set working directory for MicroPython

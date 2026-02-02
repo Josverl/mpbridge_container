@@ -4,6 +4,28 @@ A Docker container that runs the MicroPython mpremote bridge, allowing you to co
 
 ## Quick Start
 
+### Running from Docker Hub (Easiest)
+
+The fastest way to get started is to pull and run the pre-built image:
+
+```bash
+# Pull and run the latest version
+docker run -p 2217:2217 -p 2218:2218 josverlinde/mpbridge:latest
+
+# Or run in detached mode (background)
+docker run -d -p 2217:2217 -p 2218:2218 --name mpbridge josverlinde/mpbridge:latest
+
+# Stop the container
+docker stop mpbridge
+```
+
+You can now connect using `mpremote`:
+
+```bash
+# Using raw socket (faster, ~28% better performance)
+mpremote connect socket://localhost:2218
+```
+
 ### Using Docker Compose (Recommended)
 
 ```bash
@@ -121,41 +143,116 @@ docker stop mpbridge
 docker logs mpbridge
 ```
 
+## Publishing to Docker Hub
+
+### Prerequisites
+
+1. Create an account at [hub.docker.com](https://hub.docker.com)
+2. Login locally:
+   ```bash
+   docker login
+   ```
+   (Enter your Docker Hub username and password)
+
+### Publishing Steps
+
+```bash
+# 1. Build the image using docker-compose
+docker compose build
+
+# 2. Tag the image with version numbers
+docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:1.27.0.1
+docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:1.27.0
+docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:latest
+
+# 3. Push all tags to Docker Hub
+docker push josverlinde/mpbridge:1.27.0.1
+docker push josverlinde/mpbridge:1.27.0
+docker push josverlinde/mpbridge:latest
+```
+
+### Using Published Images
+
+Once published, others can use your image:
+
+```bash
+# Pull and run the latest version
+docker pull josverlinde/mpbridge:latest
+docker run -p 2217:2217 -p 2218:2218 josverlinde/mpbridge:latest
+
+# Or use a specific version
+docker run -p 2217:2217 -p 2218:2218 josverlinde/mpbridge:1.27.0.1
+
+# Or update docker-compose.yml to use remote image
+# image: josverlinde/mpbridge:1.27.0.1
+```
+
+### Recommended Workflow
+
+1. Update versions in `docker-compose.yml`
+2. Build locally: `docker compose build`
+3. Test: `docker compose up`
+4. Commit changes: `git add -A && git commit -m "Update to bridge v1.27.0.1"`
+5. Tag release: `git tag v1.27.0.1 && git push origin v1.27.0.1`
+6. Build and push to Docker Hub (see steps above)
+
 ## Build Arguments
 
-The Dockerfile supports build-time arguments to customize versions:
+The Dockerfile supports build-time arguments to customize versions. These are centrally managed in the `docker-compose.yml` file under the `x-versions` section:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `MICROPYTHON_VERSION` | `v1.27.0` | MicroPython container version tag |
 | `PYTHON_VERSION` | `3.12` | Python version for running the bridge script |
-| `BRIDGE_SCRIPT_URL` | *(GitHub URL)* | URL to the mpremote_bridge.py script |
+| `BRIDGE_VERSION` | `1.27.0.1` | Bridge container version (format: `MP_VERSION.BUILD_NUMBER`) |
 
-> **Note:** The bridge script is downloaded at build time and cached in the image. This means:
+> **Note:** The bridge script is copied from the local repo at build time and cached in the image. This means:
 > - Faster container startup (no network fetch)
 > - Works offline after build
 > - Script version is locked at build time
 
+### Version Management
+
+Use `docker-compose.yml` for centralized version management:
+
+```yaml
+x-versions:
+  micropython: &mp-version v1.27.0
+  python: &py-version 3.12
+  bridge: &bridge-version 1.27.0.1
+```
+
+Update versions here, then rebuild:
+
+```bash
+# Rebuild with versions from docker-compose.yml
+docker compose build
+```
+
 ### Examples
 
 ```bash
-# Build with default versions (MicroPython v1.27.0, Python 3.12)
-docker build -t mpbridge .
+# Build with default versions (from docker-compose.yml)
+docker compose build
 
-# Build with a specific MicroPython version
-docker build --build-arg MICROPYTHON_VERSION=v1.25.0 -t mpbridge:mp1.25 .
-
-# Build with a specific Python version
-docker build --build-arg PYTHON_VERSION=3.11 -t mpbridge:py3.11 .
-
-# Build with both custom versions
+# Build with specific versions via docker command
 docker build \
   --build-arg MICROPYTHON_VERSION=v1.25.0 \
   --build-arg PYTHON_VERSION=3.11 \
-  -t mpbridge:custom .
+  --build-arg BRIDGE_VERSION=1.25.0.1 \
+  -t mpbridge:1.25.0.1 .
 
-# Build with a custom bridge script (e.g., from a different branch or fork)
-docker build \
-  --build-arg BRIDGE_SCRIPT_URL=https://raw.githubusercontent.com/user/repo/branch/tools/mpremote_bridge.py \
-  -t mpbridge:custom-script .
+# Tag image with bridge version
+docker build -t mpbridge:1.27.0.1 .
+
+# Run specific version
+docker run -p 2217:2217 -p 2218:2218 mpbridge:1.27.0.1
 ```
+
+### Version Tag Format
+
+- `MAJOR.MINOR.PATCH.BUILD` (e.g., `1.27.0.1`)
+  - `1.27.0` = MicroPython version
+  - `.1` = Your bridge build/revision number
+  - Increment the build number when you update the bridge without changing MicroPython
+  - Change all digits when upgrading MicroPython

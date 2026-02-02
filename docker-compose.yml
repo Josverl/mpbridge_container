@@ -1,10 +1,21 @@
 name: mpbridge
 
+# Define versions at the top for easy management
+x-versions:
+  micropython: &mp-version v1.27.0
+  python: &py-version 3.12
+  bridge: &bridge-version 1.27.0.1
+
 services:
   mpbridge:
     container_name: mpbridge
-    build: .
-    image: josverl/mpbridge:1.27.0
+    build:
+      context: .
+      args:
+        MICROPYTHON_VERSION: *mp-version
+        PYTHON_VERSION: *py-version
+        BRIDGE_VERSION: *bridge-version
+    image: josverlinde/mpbridge:${BRIDGE_VERSION:-latest}
     ports:
       - "2217:2217"
       - "2218:2218"
