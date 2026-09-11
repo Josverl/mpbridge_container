@@ -157,19 +157,12 @@ docker logs mpbridge
 ### Publishing Steps
 
 ```bash
-# 1. Build the image using docker-compose
-docker compose build
-
-# 2. Tag the image with version numbers
-docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:1.27.0.1
-docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:1.27.0
-docker tag josverlinde/mpbridge:latest josverlinde/mpbridge:latest
-
-# 3. Push all tags to Docker Hub
-docker push josverlinde/mpbridge:1.27.0.1
-docker push josverlinde/mpbridge:1.27.0
-docker push josverlinde/mpbridge:latest
+# Build and publish several MicroPython releases.
+./publish-images.sh 1.27.0 1.28.0 1.29.0
 ```
+
+For each release, the script publishes a revision tag such as `1.29.0.1` and a
+release alias such as `1.29.0`. The final version is also tagged `latest`.
 
 ### Using Published Images
 
@@ -189,22 +182,24 @@ docker run -p 2217:2217 -p 2218:2218 josverlinde/mpbridge:1.27.0.1
 
 ### Recommended Workflow
 
-1. Update versions in `docker-compose.yml`
+1. Update `MP_VERSION` in `.env` for the default local build.
 2. Build locally: `docker compose build`
 3. Test: `docker compose up`
-4. Commit changes: `git add -A && git commit -m "Update to bridge v1.27.0.1"`
-5. Tag release: `git tag v1.27.0.1 && git push origin v1.27.0.1`
-6. Build and push to Docker Hub (see steps above)
+4. Commit changes: `git add -A && git commit -m "Update to bridge v1.29.0.1"`
+5. Tag release: `git tag v1.29.0.1 && git push origin v1.29.0.1`
+6. Build and push releases with `publish-images.sh`.
 
 ## Build Arguments
 
-The Dockerfile supports build-time arguments to customize versions. These are centrally managed in the `docker-compose.yml` file under the `x-versions` section:
+The Dockerfile supports build-time arguments to customize versions. Defaults are
+stored once in `.env`, and Compose derives the other values:
 
-| Argument | Default | Description |
+| Variable | Default | Description |
 |----------|---------|-------------|
-| `MICROPYTHON_VERSION` | `v1.27.0` | MicroPython container version tag |
-| `PYTHON_VERSION` | `3.12` | Python version for running the bridge script |
-| `BRIDGE_VERSION` | `1.27.0.1` | Bridge container version (format: `MP_VERSION.BUILD_NUMBER`) |
+| `MP_VERSION` | `1.29.0` | MicroPython release and image release tag |
+| `BRIDGE_REVISION` | `1` | Bridge revision appended to the immutable image tag |
+| `PYTHON_VERSION` | `3.14` | Python version for running the bridge script |
+| `IMAGE_REPOSITORY` | `josverlinde/mpbridge` | Container registry and repository |
 
 > **Note:** The bridge script is copied from the local repo at build time and cached in the image. This means:
 > - Faster container startup (no network fetch)
@@ -213,26 +208,29 @@ The Dockerfile supports build-time arguments to customize versions. These are ce
 
 ### Version Management
 
-Use `docker-compose.yml` for centralized version management:
+Use `.env` for centralized version management:
 
-```yaml
-x-versions:
-  micropython: &mp-version v1.27.0
-  python: &py-version 3.12
-  bridge: &bridge-version 1.27.0.1
+```dotenv
+MP_VERSION=1.29.0
+BRIDGE_REVISION=1
+PYTHON_VERSION=3.14
+IMAGE_REPOSITORY=josverlinde/mpbridge
 ```
 
 Update versions here, then rebuild:
 
 ```bash
-# Rebuild with versions from docker-compose.yml
+# Rebuild with defaults from .env
 docker compose build
+
+# Build one different release without editing files
+MP_VERSION=1.28.0 docker compose build
 ```
 
 ### Examples
 
 ```bash
-# Build with default versions (from docker-compose.yml)
+# Build with default versions from .env
 docker compose build
 
 # Build with specific versions via docker command

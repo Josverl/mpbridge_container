@@ -1,10 +1,11 @@
 name: mpbridge
 
-# Define versions at the top for easy management
+# Values come from .env and can be overridden for each build.
 x-versions:
-  micropython: &mp-version v1.27.0
-  python: &py-version 3.12
-  bridge: &bridge-version 1.27.0.1
+  micropython: &mp-version v${MP_VERSION}
+  python: &py-version ${PYTHON_VERSION}
+  bridge: &bridge-version ${MP_VERSION}.${BRIDGE_REVISION}
+  image: &image ${IMAGE_REPOSITORY}:${MP_VERSION}.${BRIDGE_REVISION}
 
 services:
   mpbridge:
@@ -15,7 +16,7 @@ services:
         MICROPYTHON_VERSION: *mp-version
         PYTHON_VERSION: *py-version
         BRIDGE_VERSION: *bridge-version
-    image: josverlinde/mpbridge:${BRIDGE_VERSION:-latest}
+    image: *image
     ports:
       - "2217:2217"
       - "2218:2218"
